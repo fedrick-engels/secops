@@ -1,0 +1,297 @@
+# ============================================================
+# DevSecOps Pipeline - Privacy-Preserving Application
+# Implements: SAST (Bandit) → SCA (Snyk) → Secrets (TruffleHog)
+#             → Build → Image Scan (Trivy) → Deploy (Azure)
+# ============================================================
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}          # e.g. myacr.azurecr.io
+  IMAGE_NAME: privacy-preserving-app
+  AZURE_RESOURCE_GROUP: rg-devsecops-prod
+  AZURE_CONTAINER_APP: ca-privacy-app
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # SECURITY GATE 1 — SAST with Bandit
+  # Scans Python source for insecure patterns
+  # ─────────────────────────────────────────────
+  sast-bandit:
+    name: "🔍 SAST — Bandit"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit SAST scan
+        run: |
+          bandit -r app/ \
+            --severity-level medium \
+            --confidence-level medium \
+            --format json \
+            --output bandit-report.json || true
+
+      - name: Check Bandit results (fail on HIGH severity)
+        run: |
+          python - <<'EOF'
+          import json, sys
+          with open("bandit-report.json") as f:
+              report = json.load(f)
+          high_issues = [
+              r for r in report.get("results", [])
+              if r["issue_severity"] == "HIGH"
+          ]
+          if high_issues:
+              print(f"❌ SAST FAILED: {len(high_issues)} HIGH severity issue(s) found!")
+              for i in high_issues:
+                  print(f"  - {i['issue_text']} at {i['filename']}:{i['line_number']}")
+              sys.exit(1)
+          print(f"✅ SAST PASSED: No HIGH severity issues found.")
+          EOF
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+
+  # ─────────────────────────────────────────────
+  # SECURITY GATE 2 — SCA with Snyk
+  # Scans third-party dependencies for CVEs
+  # ─────────────────────────────────────────────
+  sca-snyk:
+    name: "📦 SCA — Snyk"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Snyk dependency scan
+        uses: snyk/actions/python@master
+        continue-on-error: false
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --file=app/requirements.txt
+            --severity-threshold=high
+            --json-file-output=snyk-report.json
+
+      - name: Upload Snyk report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-report
+          path: snyk-report.json
+
+
+  # ─────────────────────────────────────────────
+  # SECURITY GATE 3 — Secrets Scan (TruffleHog)
+  # Detects accidentally committed credentials
+  # ─────────────────────────────────────────────
+  secrets-trufflehog:
+    name: "🔑 Secrets — TruffleHog"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed for commit scanning
+
+      - name: Run TruffleHog secrets scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+
+  # ─────────────────────────────────────────────
+  # UNIT TESTS
+  # ─────────────────────────────────────────────
+  unit-tests:
+    name: "🧪 Unit Tests"
+    runs-on: ubuntu-latest
+    needs: [sast-bandit, sca-snyk, secrets-trufflehog]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest pytest-cov cryptography
+
+      - name: Run tests with coverage
+        env:
+          ENCRYPTION_KEY: ${{ secrets.TEST_ENCRYPTION_KEY }}
+          SECRET_TOKEN: ${{ secrets.TEST_SECRET_TOKEN }}
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+
+  # ─────────────────────────────────────────────
+  # BUILD & PUSH Docker image to Azure ACR
+  # ─────────────────────────────────────────────
+  build-and-push:
+    name: "🐳 Build & Push Image"
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  # ─────────────────────────────────────────────
+  # SECURITY GATE 4 — Image Scan with Trivy
+  # Scans built container for OS-layer CVEs
+  # ─────────────────────────────────────────────
+  image-scan-trivy:
+    name: "🛡️ Image Scan — Trivy"
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Pull built image
+        run: docker pull ${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image_tag }}
+          format: "sarif"
+          output: "trivy-report.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"        # Fail pipeline on CRITICAL or HIGH CVEs
+
+      - name: Upload Trivy report to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-report.sarif"
+
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.sarif
+
+
+  # ─────────────────────────────────────────────
+  # DEPLOY to Azure Container Apps
+  # Only runs on main branch after all gates pass
+  # ─────────────────────────────────────────────
+  deploy-azure:
+    name: "🚀 Deploy — Azure Container Apps"
+    runs-on: ubuntu-latest
+    needs: [image-scan-trivy]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          containerAppName: ${{ env.AZURE_CONTAINER_APP }}
+          imageToDeploy: ${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Verify deployment health
+        run: |
+          echo "⏳ Waiting for deployment to stabilize..."
+          sleep 30
+          APP_URL=$(az containerapp show \
+            --name ${{ env.AZURE_CONTAINER_APP }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "📡 App URL: https://$APP_URL"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$APP_URL/health)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ Health check failed! HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✅ Deployment healthy at https://$APP_URL"
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ needs.build-and-push.outputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** Production (Azure Container Apps)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Gates:** ✅ SAST ✅ SCA ✅ Secrets ✅ Image Scan" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ✅ Deployed & Healthy" >> $GITHUB_STEP_SUMMARY

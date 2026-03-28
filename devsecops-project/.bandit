@@ -1,0 +1,16 @@
+[bandit]
+# Bandit SAST Configuration
+# Scans for Python security issues
+
+# Skip test files
+exclude_dirs = ["tests", ".git", ".venv", "node_modules"]
+
+# Minimum severity to report: LOW, MEDIUM, HIGH
+severity = "MEDIUM"
+
+# Minimum confidence to report: LOW, MEDIUM, HIGH
+confidence = "MEDIUM"
+
+# Plugin skips (with justification)
+# B101 - assert_used: acceptable in test code
+skips = []
