@@ -116,7 +116,7 @@ jobs:
   unit-tests:
     name: "🧪 Unit Tests"
     runs-on: ubuntu-latest
-    needs: [sast-bandit, sca-snyk, secrets-trufflehog]
+    needs: [sast-bandit, sca-snyk]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
