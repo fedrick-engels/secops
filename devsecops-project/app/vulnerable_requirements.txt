@@ -1,0 +1,10 @@
+# Vulnerable dependencies for demonstration
+# Snyk SCA will detect CVEs in these old versions
+
+flask==1.0.0          # CVE-2018-1000656 - ReDoS vulnerability
+requests==2.6.0       # CVE-2014-1829 - SSRF vulnerability  
+cryptography==1.9     # Multiple CVEs - outdated crypto library
+Pillow==5.2.0         # CVE-2019-16865 - DoS vulnerability
+pyyaml==3.13          # CVE-2017-18342 - Arbitrary code execution
+django==2.0.0         # CVE-2019-6975 - Memory exhaustion
+urllib3==1.22         # CVE-2018-20060 - Header injection
