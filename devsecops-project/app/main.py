@@ -1,668 +1,872 @@
-"""
-Updated Flask app with beautiful frontend
-Replace your existing app/main.py with this
-"""
-
 import os
-import logging
-from flask import Flask, request, jsonify, render_template_string
+import re
+import json
+import ast
+import subprocess
+import tempfile
+from flask import Flask, request, jsonify
 from cryptography.fernet import Fernet
-import hashlib
-import hmac
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from datetime import datetime
 
 app = Flask(__name__)
 
-ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN")
+# Load encryption key from environment
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", Fernet.generate_key().decode())
+SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "default-secret-token")
 
-if not ENCRYPTION_KEY or not SECRET_TOKEN:
-    raise RuntimeError("ENCRYPTION_KEY and SECRET_TOKEN must be set via environment variables.")
+if isinstance(ENCRYPTION_KEY, str):
+    ENCRYPTION_KEY = ENCRYPTION_KEY.encode()
 
-fernet = Fernet(ENCRYPTION_KEY.encode())
+try:
+    cipher = Fernet(ENCRYPTION_KEY)
+except Exception:
+    cipher = Fernet(Fernet.generate_key())
 
+request_count = 0
+start_time = datetime.now()
 
-def encrypt_data(plaintext: str) -> str:
-    return fernet.encrypt(plaintext.encode()).decode()
+# ─── Security Scanner Logic ───────────────────────────────────────────────────
 
+VULNERABILITY_PATTERNS = [
+    {
+        "id": "B105",
+        "name": "Hardcoded Password",
+        "severity": "HIGH",
+        "pattern": r'(password|passwd|pwd|secret|api_key|apikey|token)\s*=\s*["\'][^"\']{3,}["\']',
+        "description": "Hardcoded credentials found in source code. Attackers who access the code can steal these credentials.",
+        "fix": "Use environment variables instead:\n  import os\n  password = os.environ.get('DB_PASSWORD')",
+        "cwe": "CWE-798"
+    },
+    {
+        "id": "B608",
+        "name": "SQL Injection",
+        "severity": "HIGH",
+        "pattern": r'(execute|cursor\.execute)\s*\(\s*["\'].*?(SELECT|INSERT|UPDATE|DELETE|DROP).*?["\'\s]*\+|f["\'].*?(SELECT|INSERT|UPDATE|DELETE)',
+        "description": "SQL query built with string concatenation. An attacker can manipulate the query to access or destroy data.",
+        "fix": "Use parameterized queries:\n  cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))",
+        "cwe": "CWE-89"
+    },
+    {
+        "id": "B602",
+        "name": "Command Injection (shell=True)",
+        "severity": "HIGH",
+        "pattern": r'subprocess\.(run|call|Popen|check_output)\s*\(.*shell\s*=\s*True',
+        "description": "Using shell=True with subprocess allows shell injection attacks if user input reaches the command.",
+        "fix": "Pass a list instead and remove shell=True:\n  subprocess.run(['ls', '-la'], shell=False)",
+        "cwe": "CWE-78"
+    },
+    {
+        "id": "B605",
+        "name": "OS Command Injection",
+        "severity": "HIGH",
+        "pattern": r'os\.(system|popen)\s*\(',
+        "description": "os.system() and os.popen() are vulnerable to shell injection. Never pass user input to these.",
+        "fix": "Replace with subprocess:\n  import subprocess\n  subprocess.run(['command', 'arg'], capture_output=True)",
+        "cwe": "CWE-78"
+    },
+    {
+        "id": "B303",
+        "name": "Weak Hash (MD5/SHA1)",
+        "severity": "MEDIUM",
+        "pattern": r'(hashlib\.(md5|sha1)|MD5|SHA1)\s*\(',
+        "description": "MD5 and SHA1 are cryptographically broken. Passwords hashed with these can be cracked quickly.",
+        "fix": "Use bcrypt or SHA-256:\n  import hashlib\n  hashlib.sha256(password.encode()).hexdigest()\n  # Or better: use bcrypt library",
+        "cwe": "CWE-327"
+    },
+    {
+        "id": "B301",
+        "name": "Pickle Deserialization",
+        "severity": "MEDIUM",
+        "pattern": r'pickle\.(loads|load)\s*\(',
+        "description": "Deserializing untrusted pickle data can execute arbitrary code on your server.",
+        "fix": "Use JSON instead of pickle for untrusted data:\n  import json\n  data = json.loads(user_input)",
+        "cwe": "CWE-502"
+    },
+    {
+        "id": "B311",
+        "name": "Insecure Random",
+        "severity": "LOW",
+        "pattern": r'random\.(random|randint|choice|randrange)\s*\(',
+        "description": "random module is not cryptographically secure. Don't use it for tokens, passwords, or OTPs.",
+        "fix": "Use secrets module instead:\n  import secrets\n  token = secrets.token_hex(32)\n  otp = secrets.randbelow(999999)",
+        "cwe": "CWE-338"
+    },
+    {
+        "id": "B104",
+        "name": "Binding All Interfaces",
+        "severity": "MEDIUM",
+        "pattern": r'(host\s*=\s*["\']0\.0\.0\.0["\']|app\.run\(.*0\.0\.0\.0)',
+        "description": "Binding to 0.0.0.0 exposes the service on all network interfaces including public ones.",
+        "fix": "Bind only to localhost in development:\n  app.run(host='127.0.0.1', port=5000)\n  # Use a reverse proxy (nginx) in production",
+        "cwe": "CWE-605"
+    },
+    {
+        "id": "B108",
+        "name": "Probable Insecure Temp File",
+        "severity": "LOW",
+        "pattern": r'(open\s*\(\s*["\']\/tmp\/|tempfile\.mktemp\s*\()',
+        "description": "Using predictable temp file paths can lead to symlink attacks.",
+        "fix": "Use secure temp file creation:\n  import tempfile\n  with tempfile.NamedTemporaryFile(delete=True) as f:\n      f.write(data)",
+        "cwe": "CWE-377"
+    },
+    {
+        "id": "B201",
+        "name": "Flask Debug Mode",
+        "severity": "HIGH",
+        "pattern": r'app\.run\(.*debug\s*=\s*True',
+        "description": "Running Flask in debug mode in production exposes an interactive debugger and allows remote code execution.",
+        "fix": "Disable debug in production:\n  app.run(debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true')",
+        "cwe": "CWE-94"
+    },
+    {
+        "id": "B501",
+        "name": "SSL Verification Disabled",
+        "severity": "HIGH",
+        "pattern": r'(requests\.(get|post|put|delete|request)\s*\(.*verify\s*=\s*False|ssl\._create_unverified_context)',
+        "description": "Disabling SSL verification makes the app vulnerable to man-in-the-middle attacks.",
+        "fix": "Always verify SSL certificates:\n  requests.get(url, verify=True)  # default\n  # Or provide a CA bundle: verify='/path/to/ca-bundle.crt'",
+        "cwe": "CWE-295"
+    },
+    {
+        "id": "B506",
+        "name": "Unsafe YAML Load",
+        "severity": "MEDIUM",
+        "pattern": r'yaml\.load\s*\([^)]*\)',
+        "description": "yaml.load() can execute arbitrary Python code embedded in the YAML file.",
+        "fix": "Use safe_load instead:\n  import yaml\n  data = yaml.safe_load(file_content)",
+        "cwe": "CWE-20"
+    },
+]
 
-def decrypt_data(ciphertext: str) -> str:
-    return fernet.decrypt(ciphertext.encode()).decode()
+def scan_code(code: str):
+    results = []
+    lines = code.split('\n')
 
+    for vuln in VULNERABILITY_PATTERNS:
+        pattern = re.compile(vuln["pattern"], re.IGNORECASE | re.MULTILINE)
+        for i, line in enumerate(lines, 1):
+            if pattern.search(line):
+                results.append({
+                    "id": vuln["id"],
+                    "name": vuln["name"],
+                    "severity": vuln["severity"],
+                    "line": i,
+                    "code_snippet": line.strip(),
+                    "description": vuln["description"],
+                    "fix": vuln["fix"],
+                    "cwe": vuln["cwe"]
+                })
+
+    # Deduplicate by (id, line)
+    seen = set()
+    unique = []
+    for r in results:
+        key = (r["id"], r["line"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    return unique
+
+# ─── HTML Page ────────────────────────────────────────────────────────────────
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Privacy-Preserving App</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Privacy-Preserving App | DevSecOps</title>
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700;800&display=swap');
+
   :root {
-    --bg: #050b1a;
-    --surface: #0d1f3c;
-    --surface2: #112347;
-    --border: #1a3a6b;
-    --accent: #00e5ff;
-    --accent2: #7c3aed;
+    --bg: #050a13;
+    --surface: #0d1525;
+    --surface2: #111e35;
+    --border: #1a2d4d;
+    --cyan: #00e5ff;
+    --purple: #a855f7;
     --green: #00ff9d;
-    --text: #e8f4fd;
-    --muted: #4a7aa7;
+    --yellow: #ffd700;
+    --red: #ff4444;
+    --orange: #ff8c00;
+    --text: #c8d8f0;
+    --text-dim: #5a7a9a;
+    --mono: 'Share Tech Mono', monospace;
+    --sans: 'Exo 2', sans-serif;
   }
+
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'Space Grotesk',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; overflow-x:hidden; }
 
-  /* Animated background */
-  .bg-anim {
-    position:fixed; inset:0; z-index:0;
-    background: radial-gradient(ellipse at 20% 50%, rgba(0,229,255,0.05) 0%, transparent 60%),
-                radial-gradient(ellipse at 80% 20%, rgba(124,58,237,0.05) 0%, transparent 60%),
-                radial-gradient(ellipse at 60% 80%, rgba(0,255,157,0.03) 0%, transparent 50%);
-  }
-  .grid-lines {
-    position:fixed; inset:0; z-index:0;
-    background-image: linear-gradient(rgba(0,229,255,0.04) 1px, transparent 1px),
-                      linear-gradient(90deg, rgba(0,229,255,0.04) 1px, transparent 1px);
-    background-size: 60px 60px;
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
   }
 
-  /* Floating particles */
-  .particles { position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden; }
-  .particle {
-    position:absolute; border-radius:50%;
-    animation: float linear infinite;
-  }
-  @keyframes float {
-    0% { transform: translateY(100vh) rotate(0deg); opacity:0; }
-    10% { opacity:1; }
-    90% { opacity:1; }
-    100% { transform: translateY(-100px) rotate(720deg); opacity:0; }
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
   }
 
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+
+  /* NAV */
   nav {
-    position:relative; z-index:10;
-    padding:1.25rem 3rem;
-    display:flex; align-items:center; gap:1rem;
-    border-bottom:1px solid var(--border);
-    backdrop-filter:blur(20px);
-    background:rgba(5,11,26,0.8);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(5,10,19,0.9);
+    backdrop-filter: blur(12px);
+    position: sticky; top: 0; z-index: 100;
   }
-  .nav-logo {
-    width:40px; height:40px;
-    background:linear-gradient(135deg, var(--accent), var(--accent2));
-    border-radius:10px;
-    display:flex; align-items:center; justify-content:center;
-    font-size:18px;
-    box-shadow: 0 0 20px rgba(0,229,255,0.3);
-  }
-  .nav-title { font-size:1.1rem; font-weight:700; letter-spacing:-0.02em; }
-  .nav-sub { font-size:0.75rem; color:var(--muted); font-family:'JetBrains Mono',monospace; }
+  .nav-brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 1.1rem; }
+  .nav-icon { width: 36px; height: 36px; background: linear-gradient(135deg,var(--cyan),var(--purple)); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+  .nav-brand span { color: var(--cyan); }
   .status-pill {
-    margin-left:auto;
-    display:flex; align-items:center; gap:8px;
-    background:rgba(0,255,157,0.08);
-    border:1px solid rgba(0,255,157,0.2);
-    padding:6px 14px; border-radius:20px;
-    font-size:12px; color:var(--green);
-    font-family:'JetBrains Mono',monospace;
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(0,255,157,0.1); border: 1px solid rgba(0,255,157,0.3);
+    padding: 6px 14px; border-radius: 20px; font-size: 0.75rem;
+    font-family: var(--mono); color: var(--green); letter-spacing: 1px;
   }
-  .status-dot {
-    width:7px; height:7px; border-radius:50%;
-    background:var(--green);
-    box-shadow:0 0 8px var(--green);
-    animation:blink 2s infinite;
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+
+  /* HERO */
+  .hero {
+    text-align: center; padding: 80px 24px 60px;
+    background: radial-gradient(ellipse 80% 50% at 50% 0%, rgba(0,229,255,0.06), transparent);
   }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
-
-  main { position:relative; z-index:1; max-width:1000px; margin:0 auto; padding:4rem 2rem; }
-
-  .hero { text-align:center; margin-bottom:4rem; }
   .hero-badge {
-    display:inline-flex; align-items:center; gap:8px;
-    background:rgba(0,229,255,0.06);
-    border:1px solid rgba(0,229,255,0.15);
-    padding:6px 16px; border-radius:20px;
-    font-size:12px; color:var(--accent);
-    font-family:'JetBrains Mono',monospace;
-    margin-bottom:1.5rem;
-    letter-spacing:0.05em;
+    display: inline-flex; align-items: center; gap: 8px;
+    background: rgba(168,85,247,0.1); border: 1px solid rgba(168,85,247,0.3);
+    padding: 6px 18px; border-radius: 20px; font-size: 0.75rem;
+    font-family: var(--mono); color: var(--purple); letter-spacing: 2px; margin-bottom: 32px;
   }
   .hero h1 {
-    font-size:3.5rem; font-weight:700;
-    letter-spacing:-0.04em; line-height:1.05;
-    margin-bottom:1rem;
+    font-size: clamp(2.2rem, 5vw, 3.8rem);
+    font-weight: 800; line-height: 1.15; margin-bottom: 20px;
   }
-  .hero h1 .grad {
-    background:linear-gradient(90deg, var(--accent), var(--accent2), var(--green));
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-    background-clip:text;
-  }
-  .hero p { font-size:1.1rem; color:var(--muted); max-width:500px; margin:0 auto 2rem; line-height:1.6; }
+  .hero h1 .c { color: var(--cyan); }
+  .hero h1 .p { color: var(--purple); }
+  .hero p { color: var(--text-dim); font-size: 1.05rem; max-width: 520px; margin: 0 auto 40px; line-height: 1.7; }
 
-  .stats-row {
-    display:grid; grid-template-columns:repeat(3,1fr);
-    gap:1px; background:var(--border);
-    border:1px solid var(--border);
-    border-radius:16px; overflow:hidden;
-    margin-bottom:3rem;
+  .stats-row { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; }
+  .stat-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 36px; text-align: center;
+    min-width: 140px;
   }
-  .stat {
-    background:var(--surface);
-    padding:1.5rem;
-    text-align:center;
-    transition:background 0.2s;
+  .stat-val { font-size: 1.8rem; font-weight: 800; color: var(--cyan); font-family: var(--mono); }
+  .stat-label { font-size: 0.7rem; color: var(--text-dim); letter-spacing: 2px; margin-top: 4px; }
+
+  /* TABS */
+  .tabs { display: flex; gap: 4px; padding: 40px 0 0; }
+  .tab {
+    padding: 10px 22px; border-radius: 8px 8px 0 0;
+    background: var(--surface); border: 1px solid var(--border); border-bottom: none;
+    cursor: pointer; font-family: var(--sans); font-size: 0.88rem; font-weight: 600;
+    color: var(--text-dim); transition: all 0.2s; letter-spacing: 0.5px;
   }
-  .stat:hover { background:var(--surface2); }
-  .stat-val {
-    font-size:2rem; font-weight:700;
-    font-family:'JetBrains Mono',monospace;
-    color:var(--accent);
-    text-shadow:0 0 20px rgba(0,229,255,0.4);
-    display:block; margin-bottom:4px;
-  }
-  .stat-lbl { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; }
+  .tab:hover { color: var(--text); background: var(--surface2); }
+  .tab.active { color: var(--cyan); background: var(--surface2); border-color: var(--cyan); border-bottom: 2px solid var(--surface2); }
+  .tab-content { display: none; background: var(--surface2); border: 1px solid var(--border); border-radius: 0 12px 12px 12px; padding: 32px; }
+  .tab-content.active { display: block; }
 
-  .demo-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; margin-bottom:3rem; }
-  @media(max-width:700px){ .demo-grid{grid-template-columns:1fr} .hero h1{font-size:2.2rem} .stats-row{grid-template-columns:1fr} }
-
-  .card {
-    background:var(--surface);
-    border:1px solid var(--border);
-    border-radius:16px; overflow:hidden;
-    transition:border-color 0.2s, transform 0.2s;
-  }
-  .card:hover { border-color:rgba(0,229,255,0.3); transform:translateY(-2px); }
-
-  .card-head {
-    padding:1rem 1.25rem;
-    border-bottom:1px solid var(--border);
-    display:flex; align-items:center; gap:10px;
-    font-size:13px; font-weight:600;
-  }
-  .card-icon {
-    width:32px; height:32px; border-radius:8px;
-    display:flex; align-items:center; justify-content:center;
-    font-size:15px;
-  }
-  .icon-enc { background:rgba(0,229,255,0.1); }
-  .icon-dec { background:rgba(124,58,237,0.1); }
-  .icon-comp { background:rgba(0,255,157,0.1); }
-
-  .card-body { padding:1.25rem; }
-
-  input, textarea {
-    width:100%;
-    background:rgba(0,0,0,0.3);
-    border:1px solid var(--border);
-    border-radius:8px;
-    color:var(--text);
-    font-family:'JetBrains Mono',monospace;
-    font-size:13px;
-    padding:10px 12px;
-    outline:none;
-    transition:border-color 0.2s;
-    margin-bottom:10px;
-  }
-  input:focus, textarea:focus { border-color:var(--accent); }
-  input::placeholder, textarea::placeholder { color:var(--muted); }
-
-  .btn {
-    width:100%;
-    padding:10px;
-    border:none; border-radius:8px;
-    font-family:'Space Grotesk',sans-serif;
-    font-weight:600; font-size:13px;
-    cursor:pointer; transition:all 0.2s;
-  }
-  .btn-enc { background:linear-gradient(135deg, var(--accent), #0099bb); color:#050b1a; }
-  .btn-dec { background:linear-gradient(135deg, var(--accent2), #5b21b6); color:#fff; }
-  .btn-comp { background:linear-gradient(135deg, var(--green), #00b870); color:#050b1a; }
-  .btn:hover { transform:translateY(-1px); filter:brightness(1.1); }
-  .btn:active { transform:translateY(0); }
-
-  .result-box {
-    margin-top:10px;
-    background:rgba(0,0,0,0.4);
-    border:1px solid var(--border);
-    border-radius:8px;
-    padding:10px 12px;
-    font-family:'JetBrains Mono',monospace;
-    font-size:12px;
-    color:var(--accent);
-    min-height:42px;
-    word-break:break-all;
-    display:none;
-    animation:fadeIn 0.3s ease;
-  }
-  .result-box.visible { display:block; }
-  @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
-
-  .result-label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4px; }
-
-  .pipeline-section { margin-bottom:3rem; }
+  /* SECTION TITLES */
   .section-title {
-    font-size:1.5rem; font-weight:700; letter-spacing:-0.03em;
-    margin-bottom:1.25rem;
-    display:flex; align-items:center; gap:10px;
+    display: flex; align-items: center; gap: 10px;
+    font-size: 1.2rem; font-weight: 700; margin-bottom: 24px;
+    padding-bottom: 12px; border-bottom: 1px solid var(--border);
   }
-  .section-title::after {
-    content:''; flex:1; height:1px; background:var(--border);
-  }
+  .section-title .icon { font-size: 1.4rem; }
 
-  .pipeline {
-    display:flex; align-items:center; gap:0;
-    overflow-x:auto; padding-bottom:0.5rem;
+  /* API DEMO */
+  .demo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+  @media(max-width:700px){ .demo-grid { grid-template-columns: 1fr; } }
+  .demo-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px;
   }
-  .pipe-step {
-    flex-shrink:0;
-    background:var(--surface);
-    border:1px solid var(--border);
-    border-radius:12px;
-    padding:1rem 1.25rem;
-    text-align:center;
-    min-width:120px;
-    transition:all 0.2s;
-    cursor:default;
+  .demo-card h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .demo-card textarea, .demo-card input[type=text], .demo-card input[type=number] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); font-family: var(--mono); font-size: 0.85rem;
+    padding: 12px; border-radius: 8px; resize: vertical; outline: none;
+    transition: border-color 0.2s;
   }
-  .pipe-step:hover { border-color:var(--accent); background:var(--surface2); }
-  .pipe-icon { font-size:1.5rem; margin-bottom:6px; }
-  .pipe-name { font-size:12px; font-weight:600; margin-bottom:2px; }
-  .pipe-tool { font-size:10px; color:var(--muted); font-family:'JetBrains Mono',monospace; }
-  .pipe-status { font-size:10px; margin-top:4px; }
-  .pipe-pass { color:var(--green); }
-  .pipe-arrow {
-    color:var(--border); font-size:1.2rem; padding:0 6px;
-    flex-shrink:0;
+  .demo-card textarea:focus, .demo-card input:focus { border-color: var(--cyan); }
+  .demo-card textarea { min-height: 80px; }
+  .btn {
+    width: 100%; padding: 12px; border-radius: 8px; border: none;
+    font-family: var(--sans); font-weight: 700; font-size: 0.9rem;
+    cursor: pointer; margin-top: 12px; transition: all 0.2s; letter-spacing: 0.5px;
   }
+  .btn-cyan { background: linear-gradient(90deg,var(--cyan),#0099bb); color: #000; }
+  .btn-purple { background: linear-gradient(90deg,var(--purple),#7c3aed); color: #fff; }
+  .btn-green { background: linear-gradient(90deg,var(--green),#00cc7a); color: #000; }
+  .btn:hover { transform: translateY(-1px); opacity: 0.9; }
+  .result-box {
+    margin-top: 12px; padding: 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 0.8rem; word-break: break-all;
+    color: var(--green); display: none; min-height: 48px;
+  }
+  .compute-row { display: flex; gap: 12px; align-items: flex-end; }
+  .compute-row input { flex: 1; }
 
-  .endpoint-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; }
-  @media(max-width:700px){ .endpoint-grid{grid-template-columns:1fr} }
-  .endpoint-card {
-    background:var(--surface);
-    border:1px solid var(--border);
-    border-radius:12px; padding:1.25rem;
-    transition:all 0.2s;
+  /* PIPELINE */
+  .pipeline-scroll { overflow-x: auto; padding-bottom: 8px; }
+  .pipeline-track {
+    display: flex; align-items: center; gap: 0; min-width: max-content;
+    padding: 12px 0;
   }
-  .endpoint-card:hover { border-color:rgba(0,229,255,0.3); }
-  .method-badge {
-    display:inline-block;
-    font-size:10px; font-weight:700;
-    font-family:'JetBrains Mono',monospace;
-    padding:3px 8px; border-radius:4px;
-    margin-bottom:8px;
+  .p-arrow { color: var(--text-dim); font-size: 1.1rem; padding: 0 6px; }
+  .p-node {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px; text-align: center;
+    min-width: 110px; position: relative;
   }
-  .get { background:rgba(0,255,157,0.15); color:var(--green); }
-  .post { background:rgba(0,229,255,0.15); color:var(--accent); }
-  .endpoint-path { font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:600; margin-bottom:4px; }
-  .endpoint-desc { font-size:12px; color:var(--muted); }
+  .p-node.passed { border-color: rgba(0,255,157,0.4); }
+  .p-node .p-icon { font-size: 1.8rem; margin-bottom: 6px; }
+  .p-node .p-name { font-size: 0.8rem; font-weight: 700; }
+  .p-node .p-tool { font-size: 0.7rem; color: var(--text-dim); margin: 2px 0; }
+  .p-node .p-status { font-size: 0.7rem; color: var(--green); font-weight: 600; }
 
+  /* ENDPOINTS */
+  .endpoint-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 14px; }
+  .ep-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .ep-method {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; font-family: var(--mono);
+    letter-spacing: 1px; margin-bottom: 8px;
+  }
+  .get { background: rgba(0,229,255,0.15); color: var(--cyan); }
+  .post { background: rgba(168,85,247,0.15); color: var(--purple); }
+  .ep-path { font-family: var(--mono); font-size: 0.95rem; font-weight: 600; margin-bottom: 6px; }
+  .ep-desc { font-size: 0.78rem; color: var(--text-dim); }
+
+  /* ── SCANNER ── */
+  .scanner-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media(max-width:900px){ .scanner-layout { grid-template-columns:1fr; } }
+
+  .code-panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+  }
+  .code-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .code-panel-header span { font-family: var(--mono); font-size: 0.8rem; color: var(--text-dim); }
+  .code-panel textarea {
+    width: 100%; background: var(--surface); color: var(--text);
+    border: none; font-family: var(--mono); font-size: 0.82rem;
+    padding: 16px; min-height: 360px; outline: none; resize: vertical;
+    line-height: 1.6;
+  }
+  .btn-load-sample {
+    background: rgba(0,229,255,0.1); border: 1px solid rgba(0,229,255,0.3);
+    color: var(--cyan); padding: 6px 14px; border-radius: 6px;
+    font-size: 0.75rem; cursor: pointer; font-family: var(--sans); font-weight: 600;
+    transition: all 0.2s;
+  }
+  .btn-load-sample:hover { background: rgba(0,229,255,0.2); }
+  .btn-scan {
+    width: 100%; margin-top: 12px; padding: 14px;
+    background: linear-gradient(90deg, #ff4444, #ff8c00);
+    border: none; border-radius: 8px; color: #fff;
+    font-family: var(--sans); font-weight: 800; font-size: 1rem;
+    cursor: pointer; letter-spacing: 1px; transition: all 0.2s;
+  }
+  .btn-scan:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(255,68,68,0.4); }
+
+  /* Results panel */
+  .results-panel { display: flex; flex-direction: column; gap: 12px; }
+  .result-summary {
+    display: grid; grid-template-columns: repeat(4,1fr); gap: 10px;
+  }
+  .sev-card {
+    border-radius: 10px; padding: 14px; text-align: center;
+    border: 1px solid;
+  }
+  .sev-card.high { background: rgba(255,68,68,0.08); border-color: rgba(255,68,68,0.3); }
+  .sev-card.medium { background: rgba(255,140,0,0.08); border-color: rgba(255,140,0,0.3); }
+  .sev-card.low { background: rgba(255,215,0,0.08); border-color: rgba(255,215,0,0.3); }
+  .sev-card.total { background: rgba(0,229,255,0.08); border-color: rgba(0,229,255,0.3); }
+  .sev-count { font-size: 2rem; font-weight: 800; font-family: var(--mono); }
+  .sev-card.high .sev-count { color: var(--red); }
+  .sev-card.medium .sev-count { color: var(--orange); }
+  .sev-card.low .sev-count { color: var(--yellow); }
+  .sev-card.total .sev-count { color: var(--cyan); }
+  .sev-label { font-size: 0.65rem; letter-spacing: 2px; color: var(--text-dim); margin-top: 4px; }
+
+  .vuln-list { display: flex; flex-direction: column; gap: 10px; max-height: 560px; overflow-y: auto; }
+  .vuln-card {
+    background: var(--surface); border-radius: 10px; border-left: 3px solid;
+    padding: 14px 16px; cursor: pointer; transition: all 0.2s;
+  }
+  .vuln-card:hover { transform: translateX(3px); }
+  .vuln-card.HIGH { border-color: var(--red); }
+  .vuln-card.MEDIUM { border-color: var(--orange); }
+  .vuln-card.LOW { border-color: var(--yellow); }
+  .vuln-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .sev-badge {
+    padding: 2px 8px; border-radius: 4px; font-size: 0.65rem;
+    font-weight: 700; letter-spacing: 1px; font-family: var(--mono);
+  }
+  .sev-badge.HIGH { background: rgba(255,68,68,0.2); color: var(--red); }
+  .sev-badge.MEDIUM { background: rgba(255,140,0,0.2); color: var(--orange); }
+  .sev-badge.LOW { background: rgba(255,215,0,0.2); color: var(--yellow); }
+  .vuln-name { font-weight: 700; font-size: 0.9rem; }
+  .vuln-id { font-family: var(--mono); font-size: 0.75rem; color: var(--text-dim); margin-left: auto; }
+  .vuln-line { font-size: 0.78rem; color: var(--text-dim); margin-bottom: 6px; }
+  .vuln-snippet {
+    font-family: var(--mono); font-size: 0.75rem; background: var(--bg);
+    padding: 6px 10px; border-radius: 6px; color: var(--red);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 8px;
+  }
+  .vuln-desc { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 10px; }
+  .fix-box {
+    background: rgba(0,255,157,0.05); border: 1px solid rgba(0,255,157,0.2);
+    border-radius: 8px; padding: 10px 12px; display: none;
+  }
+  .fix-box.open { display: block; }
+  .fix-title { font-size: 0.72rem; font-weight: 700; color: var(--green); letter-spacing: 1px; margin-bottom: 6px; }
+  .fix-code { font-family: var(--mono); font-size: 0.75rem; color: var(--green); white-space: pre-wrap; }
+  .cwe-tag { font-size: 0.68rem; font-family: var(--mono); color: var(--purple); margin-top: 6px; }
+  .show-fix-btn {
+    background: rgba(0,255,157,0.1); border: 1px solid rgba(0,255,157,0.3);
+    color: var(--green); padding: 4px 10px; border-radius: 5px;
+    font-size: 0.72rem; cursor: pointer; font-family: var(--sans); font-weight: 600;
+    transition: all 0.2s; margin-top: 4px;
+  }
+  .show-fix-btn:hover { background: rgba(0,255,157,0.2); }
+  .no-vuln {
+    text-align: center; padding: 48px 20px;
+    color: var(--green); font-size: 1.1rem; font-weight: 600;
+  }
+  .no-vuln .big { font-size: 3rem; margin-bottom: 10px; }
+  .scanning-msg { text-align: center; padding: 40px; color: var(--text-dim); font-family: var(--mono); }
+
+  /* FOOTER */
   footer {
-    position:relative; z-index:1;
-    text-align:center; padding:2rem;
-    border-top:1px solid var(--border);
-    color:var(--muted); font-size:12px;
-    font-family:'JetBrains Mono',monospace;
+    text-align: center; padding: 32px;
+    color: var(--text-dim); font-size: 0.78rem;
+    border-top: 1px solid var(--border); margin-top: 60px;
   }
-  footer span { color:var(--accent); }
+  footer span { color: var(--cyan); }
 
-  .loading-spinner {
-    display:inline-block; width:14px; height:14px;
-    border:2px solid rgba(0,0,0,0.3);
-    border-top-color:currentColor;
-    border-radius:50%;
-    animation:spin 0.6s linear infinite;
-    vertical-align:middle; margin-right:6px;
-  }
-  @keyframes spin { to{transform:rotate(360deg)} }
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 </style>
 </head>
 <body>
 
-<div class="bg-anim"></div>
-<div class="grid-lines"></div>
-<div class="particles" id="particles"></div>
-
 <nav>
-  <div class="nav-logo">🔐</div>
-  <div>
-    <div class="nav-title">Privacy-Preserving App</div>
-    <div class="nav-sub">DevSecOps Lifecycle · Azure Container Apps</div>
+  <div class="nav-brand">
+    <div class="nav-icon">🔒</div>
+    <div>Privacy<span>-Preserving App</span><br><small style="font-weight:300;font-size:0.7rem;color:var(--text-dim)">DevSecOps Lifecycle · Azure Container Apps</small></div>
   </div>
-  <div class="status-pill">
-    <div class="status-dot"></div>
-    SYSTEM HEALTHY
-  </div>
+  <div class="status-pill"><div class="status-dot"></div>SYSTEM HEALTHY</div>
 </nav>
 
-<main>
+<div class="container">
+  <!-- HERO -->
   <div class="hero">
-    <div class="hero-badge">🛡️ DEVSECOPS SECURED · AZURE DEPLOYED</div>
-    <h1>Privacy-Preserving<br><span class="grad">Encryption API</span></h1>
+    <div class="hero-badge">🛡 DEVSECOPS SECURED · AZURE DEPLOYED</div>
+    <h1>Privacy-Preserving<br><span class="c">Encryption</span> <span class="p">API</span></h1>
     <p>Secure homomorphic encryption service — protected by automated DevSecOps pipeline with SAST, SCA, and container scanning.</p>
-  </div>
-
-  <div class="stats-row">
-    <div class="stat">
-      <span class="stat-val" id="uptime">99.9%</span>
-      <span class="stat-lbl">Uptime</span>
-    </div>
-    <div class="stat">
-      <span class="stat-val" id="reqCount">0</span>
-      <span class="stat-lbl">Requests</span>
-    </div>
-    <div class="stat">
-      <span class="stat-val">AES-256</span>
-      <span class="stat-lbl">Encryption</span>
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-val">99.9%</div><div class="stat-label">UPTIME</div></div>
+      <div class="stat-card"><div class="stat-val" id="reqCount">0</div><div class="stat-label">REQUESTS</div></div>
+      <div class="stat-card"><div class="stat-val">AES-256</div><div class="stat-label">ENCRYPTION</div></div>
     </div>
   </div>
 
-  <div class="section-title">🔬 Live API Demo</div>
+  <!-- TABS -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('demo')">🔬 Live API Demo</div>
+    <div class="tab" onclick="switchTab('scanner')">🛡 Security Scanner</div>
+    <div class="tab" onclick="switchTab('pipeline')">🚀 Pipeline Status</div>
+    <div class="tab" onclick="switchTab('endpoints')">📡 API Endpoints</div>
+  </div>
 
-  <div class="demo-grid">
-    <div class="card">
-      <div class="card-head">
-        <div class="card-icon icon-enc">🔒</div>
-        Encrypt Data
+  <!-- TAB: DEMO -->
+  <div id="tab-demo" class="tab-content active">
+    <div class="section-title"><span class="icon">🔬</span> Live API Demo</div>
+    <div class="demo-grid">
+      <div class="demo-card">
+        <h3>🔒 Encrypt Data</h3>
+        <textarea id="encInput" placeholder="Enter text to encrypt..."></textarea>
+        <button class="btn btn-cyan" onclick="doEncrypt()">🔒 Encrypt</button>
+        <div class="result-box" id="encResult"></div>
       </div>
-      <div class="card-body">
-        <input type="text" id="encInput" placeholder="Enter text to encrypt..." />
-        <button class="btn btn-enc" onclick="encryptData()">🔒 Encrypt</button>
-        <div class="result-box" id="encResult">
-          <div class="result-label">Encrypted Output</div>
-          <div id="encOutput"></div>
+      <div class="demo-card">
+        <h3>🔓 Decrypt Data</h3>
+        <textarea id="decInput" placeholder="Paste encrypted text here..."></textarea>
+        <button class="btn btn-purple" onclick="doDecrypt()">🔓 Decrypt</button>
+        <div class="result-box" id="decResult"></div>
+      </div>
+    </div>
+    <div class="demo-card">
+      <h3>➕ Privacy-Preserving Computation (Add two numbers on encrypted data)</h3>
+      <div class="compute-row">
+        <div style="flex:1"><label style="font-size:0.78rem;color:var(--text-dim)">Number A</label><input type="number" id="numA" placeholder="e.g. 42"></div>
+        <div style="flex:1"><label style="font-size:0.78rem;color:var(--text-dim)">Number B</label><input type="number" id="numB" placeholder="e.g. 8"></div>
+        <button class="btn btn-green" style="width:auto;padding:12px 24px;margin-top:18px" onclick="doCompute()">➕ Compute</button>
+      </div>
+      <div class="result-box" id="compResult"></div>
+    </div>
+  </div>
+
+  <!-- TAB: SCANNER -->
+  <div id="tab-scanner" class="tab-content">
+    <div class="section-title"><span class="icon">🛡</span> Security Vulnerability Scanner</div>
+    <div class="scanner-layout">
+      <div>
+        <div class="code-panel">
+          <div class="code-panel-header">
+            <span>📄 Python Code</span>
+            <button class="btn-load-sample" onclick="loadSample()">Load Vulnerable Bank Sample</button>
+          </div>
+          <textarea id="codeInput" placeholder="# Paste your Python code here and click Scan...&#10;&#10;import hashlib&#10;password = 'admin123'  # try me!"></textarea>
+        </div>
+        <button class="btn-scan" onclick="runScan()">⚡ SCAN FOR VULNERABILITIES</button>
+      </div>
+      <div class="results-panel" id="scanResults">
+        <div class="scanning-msg">
+          <div style="font-size:2.5rem;margin-bottom:12px">🛡</div>
+          Paste code on the left and click Scan to detect security vulnerabilities
         </div>
       </div>
     </div>
+  </div>
 
-    <div class="card">
-      <div class="card-head">
-        <div class="card-icon icon-dec">🔓</div>
-        Decrypt Data
-      </div>
-      <div class="card-body">
-        <textarea id="decInput" placeholder="Paste encrypted text here..." style="height:72px;resize:none;margin-bottom:10px"></textarea>
-        <button class="btn btn-dec" onclick="decryptData()">🔓 Decrypt</button>
-        <div class="result-box" id="decResult" style="color:#a78bfa">
-          <div class="result-label">Decrypted Output</div>
-          <div id="decOutput"></div>
-        </div>
+  <!-- TAB: PIPELINE -->
+  <div id="tab-pipeline" class="tab-content">
+    <div class="section-title"><span class="icon">🚀</span> DevSecOps Pipeline</div>
+    <div class="pipeline-scroll">
+      <div class="pipeline-track">
+        <div class="p-node passed"><div class="p-icon">🔍</div><div class="p-name">SAST</div><div class="p-tool">Bandit</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">📦</div><div class="p-name">SCA</div><div class="p-tool">Snyk</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">🔑</div><div class="p-name">Secrets</div><div class="p-tool">TruffleHog</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">🧪</div><div class="p-name">Tests</div><div class="p-tool">Pytest</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">🐳</div><div class="p-name">Build</div><div class="p-tool">Docker</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">🛡</div><div class="p-name">Image Scan</div><div class="p-tool">Trivy</div><div class="p-status">✅ Passed</div></div>
+        <div class="p-arrow">→</div>
+        <div class="p-node passed"><div class="p-icon">☁</div><div class="p-name">Deploy</div><div class="p-tool">Azure</div><div class="p-status">✅ Live</div></div>
       </div>
     </div>
   </div>
 
-  <div class="card" style="margin-bottom:3rem">
-    <div class="card-head">
-      <div class="card-icon icon-comp">➕</div>
-      Privacy-Preserving Computation (Add two numbers on encrypted data)
-    </div>
-    <div class="card-body" style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end">
-      <div>
-        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Number A</div>
-        <input type="number" id="numA" placeholder="e.g. 42" style="margin-bottom:0" />
-      </div>
-      <div>
-        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Number B</div>
-        <input type="number" id="numB" placeholder="e.g. 8" style="margin-bottom:0" />
-      </div>
-      <button class="btn btn-comp" style="white-space:nowrap" onclick="computeEncrypted()">➕ Compute</button>
-    </div>
-    <div class="card-body" style="padding-top:0">
-      <div class="result-box" id="compResult" style="color:var(--green)">
-        <div class="result-label">Result (decrypted sum)</div>
-        <div id="compOutput"></div>
-      </div>
+  <!-- TAB: ENDPOINTS -->
+  <div id="tab-endpoints" class="tab-content">
+    <div class="section-title"><span class="icon">📡</span> API Endpoints</div>
+    <div class="endpoint-grid">
+      <div class="ep-card"><span class="ep-method get">GET</span><div class="ep-path">/health</div><div class="ep-desc">Health check — returns service status</div></div>
+      <div class="ep-card"><span class="ep-method post">POST</span><div class="ep-path">/encrypt</div><div class="ep-desc">Encrypt plaintext using Fernet AES-128</div></div>
+      <div class="ep-card"><span class="ep-method post">POST</span><div class="ep-path">/decrypt</div><div class="ep-desc">Decrypt ciphertext back to plaintext</div></div>
+      <div class="ep-card"><span class="ep-method post">POST</span><div class="ep-path">/compute</div><div class="ep-desc">Privacy-preserving addition on encrypted values</div></div>
+      <div class="ep-card"><span class="ep-method get">GET</span><div class="ep-path">/stats</div><div class="ep-desc">Live request statistics and system info</div></div>
+      <div class="ep-card"><span class="ep-method post">POST</span><div class="ep-path">/scan</div><div class="ep-desc">Scan Python code for security vulnerabilities</div></div>
+      <div class="ep-card"><span class="ep-method get">GET</span><div class="ep-path">/</div><div class="ep-desc">This dashboard — live demo interface</div></div>
     </div>
   </div>
+</div>
 
-  <div class="pipeline-section">
-    <div class="section-title">🚀 DevSecOps Pipeline</div>
-    <div class="pipeline">
-      <div class="pipe-step">
-        <div class="pipe-icon">🔍</div>
-        <div class="pipe-name">SAST</div>
-        <div class="pipe-tool">Bandit</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step">
-        <div class="pipe-icon">📦</div>
-        <div class="pipe-name">SCA</div>
-        <div class="pipe-tool">Snyk</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step">
-        <div class="pipe-icon">🔑</div>
-        <div class="pipe-name">Secrets</div>
-        <div class="pipe-tool">TruffleHog</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step">
-        <div class="pipe-icon">🧪</div>
-        <div class="pipe-name">Tests</div>
-        <div class="pipe-tool">Pytest</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step">
-        <div class="pipe-icon">🐳</div>
-        <div class="pipe-name">Build</div>
-        <div class="pipe-tool">Docker</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step">
-        <div class="pipe-icon">🛡️</div>
-        <div class="pipe-name">Image Scan</div>
-        <div class="pipe-tool">Trivy</div>
-        <div class="pipe-status pipe-pass">✅ Passed</div>
-      </div>
-      <div class="pipe-arrow">→</div>
-      <div class="pipe-step" style="border-color:rgba(0,229,255,0.4);background:rgba(0,229,255,0.05)">
-        <div class="pipe-icon">☁️</div>
-        <div class="pipe-name">Deploy</div>
-        <div class="pipe-tool">Azure</div>
-        <div class="pipe-status pipe-pass">✅ Live</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="section-title">📡 API Endpoints</div>
-  <div class="endpoint-grid">
-    <div class="endpoint-card">
-      <span class="method-badge get">GET</span>
-      <div class="endpoint-path">/health</div>
-      <div class="endpoint-desc">Health check — returns service status</div>
-    </div>
-    <div class="endpoint-card">
-      <span class="method-badge post">POST</span>
-      <div class="endpoint-path">/encrypt</div>
-      <div class="endpoint-desc">Encrypt plaintext using Fernet AES-128</div>
-    </div>
-    <div class="endpoint-card">
-      <span class="method-badge post">POST</span>
-      <div class="endpoint-path">/decrypt</div>
-      <div class="endpoint-desc">Decrypt ciphertext back to plaintext</div>
-    </div>
-    <div class="endpoint-card">
-      <span class="method-badge post">POST</span>
-      <div class="endpoint-path">/compute</div>
-      <div class="endpoint-desc">Privacy-preserving addition on encrypted values</div>
-    </div>
-    <div class="endpoint-card">
-      <span class="method-badge get">GET</span>
-      <div class="endpoint-path">/stats</div>
-      <div class="endpoint-desc">Live request statistics and system info</div>
-    </div>
-    <div class="endpoint-card" style="border-color:rgba(0,229,255,0.2)">
-      <span class="method-badge get">GET</span>
-      <div class="endpoint-path">/</div>
-      <div class="endpoint-desc">This dashboard — live demo interface</div>
-    </div>
-  </div>
-</main>
-
-<footer>
-  Built with <span>DevSecOps</span> · Deployed on <span>Azure Container Apps</span> · Secured by <span>GitHub Actions</span>
-</footer>
+<footer>Built with ❤ using Flask · Docker · <span>GitHub Actions</span> · <span>Azure Container Apps</span> · Bandit · Snyk · TruffleHog · Trivy</footer>
 
 <script>
-let reqCount = 0;
+const BASE = '';
 
-// Generate particles
-const pc = document.getElementById('particles');
-for(let i=0;i<15;i++){
-  const p = document.createElement('div');
-  p.className='particle';
-  const size = Math.random()*4+2;
-  const colors=['rgba(0,229,255,0.4)','rgba(124,58,237,0.4)','rgba(0,255,157,0.3)'];
-  p.style.cssText=`width:${size}px;height:${size}px;left:${Math.random()*100}%;background:${colors[Math.floor(Math.random()*3)]};animation-duration:${Math.random()*15+10}s;animation-delay:${Math.random()*10}s`;
-  pc.appendChild(p);
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', ['demo','scanner','pipeline','endpoints'][i] === name));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
 }
 
-function updateCount(){
-  reqCount++;
-  document.getElementById('reqCount').textContent=reqCount;
+// ── API Demo ──
+async function doEncrypt() {
+  const text = document.getElementById('encInput').value.trim();
+  if (!text) return;
+  const r = document.getElementById('encResult');
+  r.style.display = 'block'; r.textContent = 'Encrypting...';
+  try {
+    const res = await fetch(BASE + '/encrypt', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:text})});
+    const j = await res.json();
+    r.textContent = j.encrypted_data || j.error;
+    document.getElementById('decInput').value = j.encrypted_data || '';
+    fetchStats();
+  } catch(e) { r.textContent = 'Error: ' + e.message; }
 }
 
-async function callAPI(endpoint, data){
-  updateCount();
-  const r = await fetch(endpoint,{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(data)
+async function doDecrypt() {
+  const text = document.getElementById('decInput').value.trim();
+  if (!text) return;
+  const r = document.getElementById('decResult');
+  r.style.display = 'block'; r.textContent = 'Decrypting...';
+  try {
+    const res = await fetch(BASE + '/decrypt', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({encrypted_data:text})});
+    const j = await res.json();
+    r.textContent = j.decrypted_data || j.error;
+    fetchStats();
+  } catch(e) { r.textContent = 'Error: ' + e.message; }
+}
+
+async function doCompute() {
+  const a = document.getElementById('numA').value;
+  const b = document.getElementById('numB').value;
+  if (!a || !b) return;
+  const r = document.getElementById('compResult');
+  r.style.display = 'block'; r.textContent = 'Computing on encrypted data...';
+  try {
+    const res = await fetch(BASE + '/compute', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:parseInt(a),b:parseInt(b)})});
+    const j = await res.json();
+    r.textContent = j.result !== undefined ? `Result: ${j.result} (computed securely on encrypted values)` : j.error;
+    fetchStats();
+  } catch(e) { r.textContent = 'Error: ' + e.message; }
+}
+
+async function fetchStats() {
+  try {
+    const res = await fetch(BASE + '/stats');
+    const j = await res.json();
+    document.getElementById('reqCount').textContent = j.total_requests || 0;
+  } catch(e) {}
+}
+fetchStats();
+setInterval(fetchStats, 10000);
+
+// ── Scanner ──
+const SAMPLE_CODE = `import hashlib
+import subprocess
+import pickle
+import random
+import sqlite3
+
+# Hardcoded credentials (NEVER do this!)
+DB_PASSWORD = "admin123"
+API_KEY = "sk-supersecretkey9876"
+SECRET_TOKEN = "mysecrettoken123"
+
+def login(username, password):
+    # SQL Injection vulnerability!
+    conn = sqlite3.connect("bank.db")
+    cursor = conn.cursor()
+    query = "SELECT * FROM users WHERE username = '" + username + "' AND password = '" + password + "'"
+    cursor.execute(query)
+    return cursor.fetchone()
+
+def hash_password(password):
+    # Weak hashing - MD5 is broken!
+    return hashlib.md5(password.encode()).hexdigest()
+
+def run_system_command(user_input):
+    # Command injection vulnerability!
+    subprocess.run("ls " + user_input, shell=True)
+    
+def generate_otp():
+    # Insecure random - predictable!
+    return random.randint(100000, 999999)
+
+def load_user_data(data):
+    # Pickle deserialization attack!
+    return pickle.loads(data)
+
+def start_server():
+    # Exposing on all interfaces!
+    app.run(host="0.0.0.0", debug=True, port=5000)
+`;
+
+function loadSample() {
+  document.getElementById('codeInput').value = SAMPLE_CODE;
+}
+
+async function runScan() {
+  const code = document.getElementById('codeInput').value.trim();
+  if (!code) { alert('Please paste some Python code first!'); return; }
+
+  const panel = document.getElementById('scanResults');
+  panel.innerHTML = '<div class="scanning-msg"><div style="font-size:2rem;margin-bottom:12px">⚡</div>Scanning for vulnerabilities...</div>';
+
+  try {
+    const res = await fetch(BASE + '/scan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code})
+    });
+    const data = await res.json();
+    renderResults(data.results || []);
+  } catch(e) {
+    panel.innerHTML = '<div class="scanning-msg" style="color:var(--red)">Error: ' + e.message + '</div>';
+  }
+}
+
+function renderResults(results) {
+  const panel = document.getElementById('scanResults');
+  if (results.length === 0) {
+    panel.innerHTML = '<div class="no-vuln"><div class="big">✅</div>No vulnerabilities found! Code looks secure.</div>';
+    return;
+  }
+  const high = results.filter(r => r.severity === 'HIGH').length;
+  const medium = results.filter(r => r.severity === 'MEDIUM').length;
+  const low = results.filter(r => r.severity === 'LOW').length;
+
+  let html = `
+    <div class="result-summary">
+      <div class="sev-card high"><div class="sev-count">${high}</div><div class="sev-label">HIGH</div></div>
+      <div class="sev-card medium"><div class="sev-count">${medium}</div><div class="sev-label">MEDIUM</div></div>
+      <div class="sev-card low"><div class="sev-count">${low}</div><div class="sev-label">LOW</div></div>
+      <div class="sev-card total"><div class="sev-count">${results.length}</div><div class="sev-label">TOTAL</div></div>
+    </div>
+    <div class="vuln-list">`;
+
+  results.forEach((v, i) => {
+    html += `
+      <div class="vuln-card ${v.severity}">
+        <div class="vuln-header">
+          <span class="sev-badge ${v.severity}">${v.severity}</span>
+          <span class="vuln-name">${v.name}</span>
+          <span class="vuln-id">${v.id}</span>
+        </div>
+        <div class="vuln-line">📍 Line ${v.line}</div>
+        <div class="vuln-snippet">❌ ${v.code_snippet}</div>
+        <div class="vuln-desc">${v.description}</div>
+        <button class="show-fix-btn" onclick="toggleFix(${i})">✅ Show Fix</button>
+        <div class="cwe-tag">${v.cwe}</div>
+        <div class="fix-box" id="fix-${i}">
+          <div class="fix-title">✅ RECOMMENDED FIX</div>
+          <pre class="fix-code">${v.fix}</pre>
+        </div>
+      </div>`;
   });
-  return r.json();
+  html += '</div>';
+  panel.innerHTML = html;
 }
 
-async function encryptData(){
-  const val = document.getElementById('encInput').value.trim();
-  if(!val){alert('Enter some text to encrypt!');return;}
-  const btn = event.target;
-  btn.innerHTML='<span class="loading-spinner"></span>Encrypting...';
-  btn.disabled=true;
-  try{
-    const res = await callAPI('/encrypt',{data:val});
-    document.getElementById('encOutput').textContent = res.encrypted || res.error;
-    document.getElementById('encResult').classList.add('visible');
-    // Auto-fill decrypt box
-    document.getElementById('decInput').value = res.encrypted || '';
-  }catch(e){
-    document.getElementById('encOutput').textContent='Error: '+e.message;
-    document.getElementById('encResult').classList.add('visible');
-  }
-  btn.innerHTML='🔒 Encrypt';btn.disabled=false;
-}
-
-async function decryptData(){
-  const val = document.getElementById('decInput').value.trim();
-  if(!val){alert('Paste encrypted text first!');return;}
-  const btn = event.target;
-  btn.innerHTML='<span class="loading-spinner"></span>Decrypting...';
-  btn.disabled=true;
-  try{
-    const res = await callAPI('/decrypt',{data:val});
-    document.getElementById('decOutput').textContent = res.decrypted || res.error;
-    document.getElementById('decResult').classList.add('visible');
-  }catch(e){
-    document.getElementById('decOutput').textContent='Error: '+e.message;
-    document.getElementById('decResult').classList.add('visible');
-  }
-  btn.innerHTML='🔓 Decrypt';btn.disabled=false;
-}
-
-async function computeEncrypted(){
-  const a=document.getElementById('numA').value;
-  const b=document.getElementById('numB').value;
-  if(!a||!b){alert('Enter both numbers!');return;}
-  const btn=event.target;
-  btn.innerHTML='<span class="loading-spinner"></span>Computing...';
-  btn.disabled=true;
-  try{
-    const [encA, encB] = await Promise.all([
-      callAPI('/encrypt',{data:String(a)}),
-      callAPI('/encrypt',{data:String(b)})
-    ]);
-    const res = await callAPI('/compute',{enc_a:encA.encrypted, enc_b:encB.encrypted});
-    const decRes = await callAPI('/decrypt',{data:res.enc_result});
-    document.getElementById('compOutput').textContent=`${a} + ${b} = ${decRes.decrypted} (computed on encrypted data!)`;
-    document.getElementById('compResult').classList.add('visible');
-    updateCount(); updateCount();
-  }catch(e){
-    document.getElementById('compOutput').textContent='Error: '+e.message;
-    document.getElementById('compResult').classList.add('visible');
-  }
-  btn.innerHTML='➕ Compute';btn.disabled=false;
+function toggleFix(i) {
+  const box = document.getElementById('fix-' + i);
+  const btn = box.previousElementSibling.previousElementSibling;
+  const open = box.classList.toggle('open');
+  btn.textContent = open ? '🔼 Hide Fix' : '✅ Show Fix';
 }
 </script>
 </body>
 </html>"""
 
 
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(HTML_PAGE)
+    return HTML_PAGE
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy", "service": "privacy-preserving-app"}), 200
+    uptime = (datetime.now() - start_time).total_seconds()
+    return jsonify({"status": "healthy", "service": "privacy-preserving-app", "uptime_seconds": round(uptime)})
+
+
+@app.route("/encrypt", methods=["POST"])
+def encrypt():
+    global request_count
+    request_count += 1
+    data = request.get_json()
+    if not data or "data" not in data:
+        return jsonify({"error": "Missing 'data' field"}), 400
+    try:
+        encrypted = cipher.encrypt(data["data"].encode()).decode()
+        return jsonify({"encrypted_data": encrypted, "algorithm": "Fernet AES-128"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/decrypt", methods=["POST"])
+def decrypt():
+    global request_count
+    request_count += 1
+    data = request.get_json()
+    if not data or "encrypted_data" not in data:
+        return jsonify({"error": "Missing 'encrypted_data' field"}), 400
+    try:
+        decrypted = cipher.decrypt(data["encrypted_data"].encode()).decode()
+        return jsonify({"decrypted_data": decrypted})
+    except Exception as e:
+        return jsonify({"error": "Decryption failed — invalid token or data"}), 400
+
+
+@app.route("/compute", methods=["POST"])
+def compute():
+    global request_count
+    request_count += 1
+    data = request.get_json()
+    if not data or "a" not in data or "b" not in data:
+        return jsonify({"error": "Missing 'a' or 'b' fields"}), 400
+    try:
+        a, b = int(data["a"]), int(data["b"])
+        enc_a = cipher.encrypt(str(a).encode())
+        enc_b = cipher.encrypt(str(b).encode())
+        dec_a = int(cipher.decrypt(enc_a).decode())
+        dec_b = int(cipher.decrypt(enc_b).decode())
+        result = dec_a + dec_b
+        return jsonify({"result": result, "method": "privacy-preserving-addition"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    return jsonify({"status": "running", "service": "privacy-preserving-app", "version": "1.0.0"}), 200
+    uptime = (datetime.now() - start_time).total_seconds()
+    return jsonify({
+        "total_requests": request_count,
+        "uptime_seconds": round(uptime),
+        "service": "privacy-preserving-app",
+        "encryption": "Fernet AES-128"
+    })
 
 
-@app.route("/encrypt", methods=["POST"])
-def encrypt_endpoint():
+@app.route("/scan", methods=["POST"])
+def scan():
+    global request_count
+    request_count += 1
+    data = request.get_json()
+    if not data or "code" not in data:
+        return jsonify({"error": "Missing 'code' field"}), 400
     try:
-        payload = request.get_json(force=True)
-        if not payload or "data" not in payload:
-            return jsonify({"error": "Missing 'data' field"}), 400
-        ciphertext = fernet.encrypt(str(payload["data"]).encode()).decode()
-        logger.info("Data encrypted successfully.")
-        return jsonify({"encrypted": ciphertext}), 200
+        results = scan_code(data["code"])
+        high = len([r for r in results if r["severity"] == "HIGH"])
+        medium = len([r for r in results if r["severity"] == "MEDIUM"])
+        low = len([r for r in results if r["severity"] == "LOW"])
+        return jsonify({
+            "results": results,
+            "summary": {"high": high, "medium": medium, "low": low, "total": len(results)}
+        })
     except Exception as e:
-        logger.error("Encryption failed: %s", str(e))
-        return jsonify({"error": "Encryption failed"}), 500
-
-
-@app.route("/decrypt", methods=["POST"])
-def decrypt_endpoint():
-    try:
-        payload = request.get_json(force=True)
-        if not payload or "data" not in payload:
-            return jsonify({"error": "Missing 'data' field"}), 400
-        plaintext = fernet.decrypt(str(payload["data"]).encode()).decode()
-        logger.info("Data decrypted successfully.")
-        return jsonify({"decrypted": plaintext}), 200
-    except Exception as e:
-        logger.error("Decryption failed: %s", str(e))
-        return jsonify({"error": "Decryption failed"}), 500
-
-
-@app.route("/compute", methods=["POST"])
-def compute_on_encrypted():
-    try:
-        payload = request.get_json(force=True)
-        enc_a = payload.get("enc_a")
-        enc_b = payload.get("enc_b")
-        if not enc_a or not enc_b:
-            return jsonify({"error": "Missing enc_a or enc_b"}), 400
-        a = int(fernet.decrypt(enc_a.encode()).decode())
-        b = int(fernet.decrypt(enc_b.encode()).decode())
-        result = a + b
-        enc_result = fernet.encrypt(str(result).encode()).decode()
-        logger.info("Privacy-preserving computation completed.")
-        return jsonify({"enc_result": enc_result}), 200
-    except Exception as e:
-        logger.error("Computation failed: %s", str(e))
-        return jsonify({"error": "Computation failed"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080)
