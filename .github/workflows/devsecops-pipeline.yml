@@ -22,15 +22,52 @@ jobs:
         run: |
           pip install bandit
           bandit -r devsecops-project/app/ -f json -o bandit-report.json || true
-          echo "SAST scan complete"
+          bandit -r devsecops-project/app/ -f html -o bandit-report.html || true
+
+      - name: Bandit Summary
+        run: |
+          pip install jq 2>/dev/null || true
+          python3 - <<'EOF'
+          import json
+          with open("bandit-report.json") as f:
+              r = json.load(f)
+          t = r["metrics"]["_totals"]
+          results = r.get("results", [])
+          high = [x for x in results if x["issue_severity"] == "HIGH"]
+          medium = [x for x in results if x["issue_severity"] == "MEDIUM"]
+          low = [x for x in results if x["issue_severity"] == "LOW"]
+
+          print("## Bandit SAST Security Report", flush=True)
+          print(f"| Severity | Count |", flush=True)
+          print(f"|----------|-------|", flush=True)
+          print(f"| HIGH     | {t['SEVERITY.HIGH']} |", flush=True)
+          print(f"| MEDIUM   | {t['SEVERITY.MEDIUM']} |", flush=True)
+          print(f"| LOW      | {t['SEVERITY.LOW']} |", flush=True)
+          print(f"| **Total**| **{t['SEVERITY.HIGH']+t['SEVERITY.MEDIUM']+t['SEVERITY.LOW']}** |", flush=True)
+          print("", flush=True)
+          print("### HIGH Severity Issues", flush=True)
+          for i in high:
+              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
+              print(f"  - {i['issue_text']}", flush=True)
+          print("", flush=True)
+          print("### MEDIUM Severity Issues", flush=True)
+          for i in medium:
+              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
+              print(f"  - {i['issue_text']}", flush=True)
+          print("", flush=True)
+          print("### LOW Severity Issues", flush=True)
+          for i in low:
+              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
+              print(f"  - {i['issue_text']}", flush=True)
+          EOF >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bandit-report
-          path: bandit-report.json
-
-
+          path: |
+            bandit-report.json
+            bandit-report.html
   sca-snyk:
     name: "SCA - Snyk"
     runs-on: ubuntu-latest
