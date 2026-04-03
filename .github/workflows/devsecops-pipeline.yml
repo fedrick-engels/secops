@@ -26,40 +26,39 @@ jobs:
 
       - name: Bandit Summary
         run: |
-          pip install jq 2>/dev/null || true
-          python3 - <<'EOF'
+          python3 -c "
           import json
-          with open("bandit-report.json") as f:
+          with open('bandit-report.json') as f:
               r = json.load(f)
-          t = r["metrics"]["_totals"]
-          results = r.get("results", [])
-          high = [x for x in results if x["issue_severity"] == "HIGH"]
-          medium = [x for x in results if x["issue_severity"] == "MEDIUM"]
-          low = [x for x in results if x["issue_severity"] == "LOW"]
-
-          print("## Bandit SAST Security Report", flush=True)
-          print(f"| Severity | Count |", flush=True)
-          print(f"|----------|-------|", flush=True)
-          print(f"| HIGH     | {t['SEVERITY.HIGH']} |", flush=True)
-          print(f"| MEDIUM   | {t['SEVERITY.MEDIUM']} |", flush=True)
-          print(f"| LOW      | {t['SEVERITY.LOW']} |", flush=True)
-          print(f"| **Total**| **{t['SEVERITY.HIGH']+t['SEVERITY.MEDIUM']+t['SEVERITY.LOW']}** |", flush=True)
-          print("", flush=True)
-          print("### HIGH Severity Issues", flush=True)
+          t = r['metrics']['_totals']
+          results = r.get('results', [])
+          high = [x for x in results if x['issue_severity'] == 'HIGH']
+          medium = [x for x in results if x['issue_severity'] == 'MEDIUM']
+          low = [x for x in results if x['issue_severity'] == 'LOW']
+          lines = []
+          lines.append('## Bandit SAST Security Report')
+          lines.append('| Severity | Count |')
+          lines.append('|----------|-------|')
+          lines.append(f'| HIGH | {len(high)} |')
+          lines.append(f'| MEDIUM | {len(medium)} |')
+          lines.append(f'| LOW | {len(low)} |')
+          lines.append(f'| **Total** | **{len(results)}** |')
+          lines.append('')
+          lines.append('### HIGH Severity Issues')
           for i in high:
-              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
-              print(f"  - {i['issue_text']}", flush=True)
-          print("", flush=True)
-          print("### MEDIUM Severity Issues", flush=True)
+              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
+          lines.append('')
+          lines.append('### MEDIUM Severity Issues')
           for i in medium:
-              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
-              print(f"  - {i['issue_text']}", flush=True)
-          print("", flush=True)
-          print("### LOW Severity Issues", flush=True)
+              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
+          lines.append('')
+          lines.append('### LOW Severity Issues')
           for i in low:
-              print(f"- **{i['test_name']}** ({i['test_id']}) — `{i['filename']}` line {i['line_number']}", flush=True)
-              print(f"  - {i['issue_text']}", flush=True)
-          EOF >> $GITHUB_STEP_SUMMARY
+              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
+          with open('summary.md', 'w') as f:
+              f.write('\n'.join(lines))
+          "
+          cat summary.md >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -68,6 +67,8 @@ jobs:
           path: |
             bandit-report.json
             bandit-report.html
+
+
   sca-snyk:
     name: "SCA - Snyk"
     runs-on: ubuntu-latest
@@ -193,7 +194,6 @@ jobs:
             --name "ca-privacy-app" \
             --resource-group "rg-devsecops-prod" \
             --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "App deployed at: https://$APP_URL"
           echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "- **App URL:** https://$APP_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** ${{ secrets.ACR_LOGIN_SERVER }}/privacy-preserving-app:latest" >> $GITHUB_STEP_SUMMARY
