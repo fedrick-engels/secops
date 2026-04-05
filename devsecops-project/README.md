@@ -201,3 +201,4 @@ docker run -p 8080:8080 \
 - [Trivy GitHub Action](https://github.com/aquasecurity/trivy-action)
 - [Azure Container Apps](https://learn.microsoft.com/en-us/azure/container-apps/)
 # DevSecOps Pipeline
+# trigger
