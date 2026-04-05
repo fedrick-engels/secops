@@ -198,3 +198,46 @@ jobs:
           echo "- **App URL:** https://$APP_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** ${{ secrets.ACR_LOGIN_SERVER }}/privacy-preserving-app:latest" >> $GITHUB_STEP_SUMMARY
           echo "- **Security Gates:** SAST, SCA, Secrets, Unit Tests, Image Scan - ALL PASSED" >> $GITHUB_STEP_SUMMARY
+
+
+  notify-slack:
+    name: "Slack Notification"
+    runs-on: ubuntu-latest
+    needs: [deploy-azure]
+    if: always()
+    steps:
+      - name: Notify Success
+        if: needs.deploy-azure.result == 'success'
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{
+            "text": "✅ *DevSecOps Pipeline PASSED* 🚀",
+            "attachments": [{
+              "color": "#00ff9d",
+              "fields": [
+                {"title": "Repository", "value": "${{ github.repository }}", "short": true},
+                {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                {"title": "Triggered by", "value": "${{ github.actor }}", "short": true},
+                {"title": "Status", "value": "Deployed to Azure ☁️", "short": true},
+                {"title": "Security Gates", "value": "✅ SAST  ✅ SCA  ✅ Secrets  ✅ Tests  ✅ Image Scan", "short": false},
+                {"title": "Live App", "value": "https://ca-privacy-app.icyisland-40162700.westus2.azurecontainerapps.io", "short": false}
+              ]
+            }]
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Failure
+        if: needs.deploy-azure.result == 'failure'
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{
+            "text": "❌ *DevSecOps Pipeline FAILED* ⚠️",
+            "attachments": [{
+              "color": "#ff4d6d",
+              "fields": [
+                {"title": "Repository", "value": "${{ github.repository }}", "short": true},
+                {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                {"title": "Triggered by", "value": "${{ github.actor }}", "short": true},
+                {"title": "Action Required", "value": "Check GitHub Actions for details", "short": false}
+              ]
+            }]
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
