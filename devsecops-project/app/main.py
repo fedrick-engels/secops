@@ -116,6 +116,46 @@ HTML_PAGE = """<!DOCTYPE html>
   .expandable{display:none;}
   .expandable.open{display:block;margin-top:10px;}
 
+  /* SAST COMPARISON TABLE */
+  .sast-section{margin-bottom:3rem;}
+  .sast-table-wrap{overflow-x:auto;border-radius:14px;border:1px solid var(--border);}
+  .sast-table{width:100%;border-collapse:collapse;font-size:13px;}
+  .sast-table thead tr{background:var(--surface2);}
+  .sast-table th{padding:12px 16px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);border-bottom:1px solid var(--border);}
+  .sast-table th.center,.sast-table td.center{text-align:center;}
+  .sast-table tbody tr{background:var(--surface);border-bottom:1px solid var(--border);transition:background .15s;}
+  .sast-table tbody tr:last-child{border-bottom:none;}
+  .sast-table tbody tr:hover{background:var(--surface2);}
+  .sast-table td{padding:13px 16px;font-family:'JetBrains Mono',monospace;font-size:12px;}
+  .sast-table td.filename{font-weight:600;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;}
+  .sast-table td.n-zero{color:var(--muted);}
+  .sast-table td.n-high{color:var(--red);}
+  .sast-table td.n-med{color:var(--yellow);}
+  .sast-table td.n-low{color:var(--green);}
+  .sast-table td.n-tot{color:var(--text);font-weight:600;}
+  .status-insecure{display:inline-flex;align-items:center;gap:6px;background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.25);color:#ff6b87;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:'Space Grotesk',sans-serif;}
+  .status-secure{display:inline-flex;align-items:center;gap:6px;background:rgba(0,255,157,.08);border:1px solid rgba(0,255,157,.25);color:var(--green);padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:'Space Grotesk',sans-serif;}
+  .status-review{display:inline-flex;align-items:center;gap:6px;background:rgba(255,209,102,.08);border:1px solid rgba(255,209,102,.25);color:var(--yellow);padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:'Space Grotesk',sans-serif;}
+  .sast-legend{display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;}
+  .legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);}
+  .legend-dot{width:8px;height:8px;border-radius:50%;}
+  .sast-findings{margin-top:1.5rem;}
+  .finding-group{margin-bottom:1.25rem;}
+  .finding-group-head{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:10px 10px 0 0;cursor:pointer;transition:background .15s;}
+  .finding-group-head:hover{background:rgba(26,58,107,.6);}
+  .finding-group-body{border:1px solid var(--border);border-top:none;border-radius:0 0 10px 10px;overflow:hidden;}
+  .finding-row{display:grid;grid-template-columns:80px 1fr 1fr;gap:0;border-bottom:1px solid var(--border);}
+  .finding-row:last-child{border-bottom:none;}
+  .finding-cell{padding:10px 14px;font-size:12px;font-family:'JetBrains Mono',monospace;}
+  .finding-cell.sev-col{display:flex;align-items:center;}
+  .finding-cell.rule-col{color:var(--muted);}
+  .finding-cell.desc-col{color:#94a3b8;border-left:1px solid var(--border);}
+  .finding-row:nth-child(odd) .finding-cell{background:rgba(0,0,0,.15);}
+  .toggle-icon{margin-left:auto;color:var(--muted);font-size:14px;transition:transform .2s;}
+  .toggle-icon.open{transform:rotate(180deg);}
+  .collapsible-body{display:none;}
+  .collapsible-body.open{display:block;}
+
   /* PIPELINE */
   .pipeline{display:flex;align-items:center;overflow-x:auto;padding-bottom:.5rem;gap:0;margin-bottom:3rem;}
   .pipe-step{flex-shrink:0;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.25rem;text-align:center;min-width:120px;transition:all .2s;}
@@ -199,6 +239,160 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="result-box" id="compResult" style="color:var(--green)"><div class="result-label">Result</div><div id="compOutput"></div></div>
     </div>
   </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- SAST BANDIT COMPARISON SECTION (NEW)                    -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="section-title">🔍 SAST Bandit Security Report — Before vs After</div>
+  <div class="sast-section">
+
+    <!-- Summary comparison table -->
+    <div class="sast-table-wrap">
+      <table class="sast-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th class="center">HIGH</th>
+            <th class="center">MEDIUM</th>
+            <th class="center">LOW</th>
+            <th class="center">Total</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="filename">vulnerable_bank.py</td>
+            <td class="center n-high">4</td>
+            <td class="center n-med">4</td>
+            <td class="center n-low">7</td>
+            <td class="center n-tot">15</td>
+            <td><span class="status-insecure">✗ INSECURE</span></td>
+          </tr>
+          <tr>
+            <td class="filename">secure_bank.py</td>
+            <td class="center n-zero">0</td>
+            <td class="center n-zero">0</td>
+            <td class="center n-zero">0</td>
+            <td class="center n-zero">0</td>
+            <td><span class="status-secure">✓ SECURE</span></td>
+          </tr>
+          <tr>
+            <td class="filename">main.py</td>
+            <td class="center n-zero">0</td>
+            <td class="center n-med">1</td>
+            <td class="center n-zero">0</td>
+            <td class="center n-tot">1</td>
+            <td><span class="status-review">⚠ NEEDS REVIEW</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="sast-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>HIGH — Critical security issues</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div>MEDIUM — Significant risk</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>LOW — Minor concerns</div>
+    </div>
+
+    <!-- Expandable findings per file -->
+    <div class="sast-findings">
+
+      <!-- vulnerable_bank.py HIGH findings -->
+      <div class="finding-group">
+        <div class="finding-group-head" onclick="toggleFindings('vbank-high',this)">
+          <span class="sev-badge b-HIGH">HIGH</span>
+          <span style="font-size:13px;font-weight:600">HIGH Severity Issues — vulnerable_bank.py</span>
+          <span style="font-size:12px;color:var(--muted);margin-left:8px">4 issues</span>
+          <span class="toggle-icon">▼</span>
+        </div>
+        <div class="finding-group-body collapsible-body" id="vbank-high">
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-HIGH">B324</span></div>
+            <div class="finding-cell rule-col">CWE-327 · line 30</div>
+            <div class="finding-cell desc-col">Use of weak MD5 hash for security. Consider usedforsecurity=False</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-HIGH">B324</span></div>
+            <div class="finding-cell rule-col">CWE-327 · line 34</div>
+            <div class="finding-cell desc-col">Use of weak SHA1 hash for security. Consider usedforsecurity=False</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-HIGH">B602</span></div>
+            <div class="finding-cell rule-col">CWE-78 · line 65</div>
+            <div class="finding-cell desc-col">subprocess call with shell=True identified, security issue</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-HIGH">B605</span></div>
+            <div class="finding-cell rule-col">CWE-78 · line 69</div>
+            <div class="finding-cell desc-col">Starting a process with a shell, possible injection detected</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- vulnerable_bank.py MEDIUM findings -->
+      <div class="finding-group">
+        <div class="finding-group-head" onclick="toggleFindings('vbank-med',this)">
+          <span class="sev-badge b-MEDIUM">MEDIUM</span>
+          <span style="font-size:13px;font-weight:600">MEDIUM Severity Issues — vulnerable_bank.py</span>
+          <span style="font-size:12px;color:var(--muted);margin-left:8px">4 issues</span>
+          <span class="toggle-icon">▼</span>
+        </div>
+        <div class="finding-group-body collapsible-body" id="vbank-med">
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-MEDIUM">B608</span></div>
+            <div class="finding-cell rule-col">CWE-89 · line 45</div>
+            <div class="finding-cell desc-col">Possible SQL injection vector through string-based query construction</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-MEDIUM">B608</span></div>
+            <div class="finding-cell rule-col">CWE-89 · line 54</div>
+            <div class="finding-cell desc-col">Possible SQL injection vector through string-based query construction</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-MEDIUM">B301</span></div>
+            <div class="finding-cell rule-col">CWE-502 · line 77</div>
+            <div class="finding-cell desc-col">Pickle and modules that wrap it can be unsafe when deserializing untrusted data</div>
+          </div>
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-MEDIUM">B104</span></div>
+            <div class="finding-cell rule-col">CWE-605 · line 100</div>
+            <div class="finding-cell desc-col">Possible binding to all interfaces</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- secure_bank.py — all clear -->
+      <div class="finding-group">
+        <div class="finding-group-head" style="cursor:default">
+          <span class="sev-badge b-LOW" style="background:rgba(0,255,157,.2);color:#00ff9d">SECURE</span>
+          <span style="font-size:13px;font-weight:600">secure_bank.py</span>
+          <span style="font-size:12px;color:var(--green);margin-left:8px">✓ No issues found — 0 vulnerabilities</span>
+          <span style="margin-left:auto;font-size:18px">✅</span>
+        </div>
+      </div>
+
+      <!-- main.py MEDIUM findings -->
+      <div class="finding-group">
+        <div class="finding-group-head" onclick="toggleFindings('main-med',this)">
+          <span class="sev-badge b-MEDIUM">MEDIUM</span>
+          <span style="font-size:13px;font-weight:600">MEDIUM Severity Issues — main.py</span>
+          <span style="font-size:12px;color:var(--muted);margin-left:8px">1 issue</span>
+          <span class="toggle-icon">▼</span>
+        </div>
+        <div class="finding-group-body collapsible-body" id="main-med">
+          <div class="finding-row">
+            <div class="finding-cell sev-col"><span class="sev-badge b-MEDIUM">B104</span></div>
+            <div class="finding-cell rule-col">CWE-605 · line 100</div>
+            <div class="finding-cell desc-col">Possible binding to all interfaces — app.run(host="0.0.0.0"). Review if intentional for container deployment.</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- END SAST BANDIT COMPARISON SECTION                      -->
+  <!-- ═══════════════════════════════════════════════════════ -->
 
   <!-- VULNERABILITIES SECTION -->
   <div class="section-title">⚠️ Cryptographic Risks & Vulnerabilities Detected</div>
@@ -407,6 +601,12 @@ function filterVulns(sev,btn){
   const cls={all:'active-all',HIGH:'active-high',MEDIUM:'active-medium',LOW:'active-low'};
   btn.classList.add(cls[sev]||'active-all');
   document.querySelectorAll('.vuln-card').forEach(c=>{c.style.display=(sev==='all'||c.dataset.sev===sev)?'block':'none';});
+}
+function toggleFindings(id, headEl){
+  const body=document.getElementById(id);
+  const icon=headEl.querySelector('.toggle-icon');
+  body.classList.toggle('open');
+  icon.classList.toggle('open');
 }
 </script>
 </body>
