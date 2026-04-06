@@ -1,0 +1,7 @@
+# Secure, up-to-date dependencies
+# Snyk SCA should find zero HIGH/CRITICAL CVEs
+
+flask==3.0.3
+cryptography==42.0.8
+gunicorn==22.0.0
+requests==2.32.3
