@@ -18,43 +18,98 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run Bandit
-        run: |
-          pip install bandit
-          bandit -r devsecops-project/app/ -f json -o bandit-report.json || true
-          bandit -r devsecops-project/app/ -f html -o bandit-report.html || true
+      - name: Install Bandit
+        run: pip install bandit
 
-      - name: Bandit Summary
+      - name: Scan main app (secure production code)
+        run: |
+          bandit -r devsecops-project/app/main.py -f json -o bandit-main.json || true
+          bandit -r devsecops-project/app/main.py -f html -o bandit-main.html || true
+
+      - name: Scan vulnerable bank (should have issues)
+        run: |
+          bandit -r devsecops-project/app/vulnerable_bank.py -f json -o bandit-vuln.json || true
+
+      - name: Scan secure bank (should be clean)
+        run: |
+          bandit -r devsecops-project/app/secure_bank.py -f json -o bandit-secure.json || true
+
+      - name: Generate comparison summary
         run: |
           python3 -c "
           import json
-          with open('bandit-report.json') as f:
-              r = json.load(f)
-          t = r['metrics']['_totals']
-          results = r.get('results', [])
-          high = [x for x in results if x['issue_severity'] == 'HIGH']
-          medium = [x for x in results if x['issue_severity'] == 'MEDIUM']
-          low = [x for x in results if x['issue_severity'] == 'LOW']
+
+          def load(f):
+              try:
+                  with open(f) as fp:
+                      return json.load(fp)
+              except:
+                  return {'results': [], 'metrics': {'_totals': {'SEVERITY.HIGH': 0, 'SEVERITY.MEDIUM': 0, 'SEVERITY.LOW': 0}}}
+
+          vuln   = load('bandit-vuln.json')
+          secure = load('bandit-secure.json')
+          main   = load('bandit-main.json')
+
+          def counts(r):
+              res = r.get('results', [])
+              h = len([x for x in res if x['issue_severity'] == 'HIGH'])
+              m = len([x for x in res if x['issue_severity'] == 'MEDIUM'])
+              l = len([x for x in res if x['issue_severity'] == 'LOW'])
+              return h, m, l
+
+          vh, vm, vl = counts(vuln)
+          sh, sm, sl = counts(secure)
+          mh, mm, ml = counts(main)
+
           lines = []
-          lines.append('## Bandit SAST Security Report')
-          lines.append('| Severity | Count |')
-          lines.append('|----------|-------|')
-          lines.append(f'| HIGH | {len(high)} |')
-          lines.append(f'| MEDIUM | {len(medium)} |')
-          lines.append(f'| LOW | {len(low)} |')
-          lines.append(f'| **Total** | **{len(results)}** |')
+          lines.append('## 🔍 Bandit SAST Security Report')
           lines.append('')
-          lines.append('### HIGH Severity Issues')
-          for i in high:
-              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
+          lines.append('### 📊 Before vs After — Vulnerable vs Secure Code')
+          lines.append('| File | HIGH | MEDIUM | LOW | Total | Status |')
+          lines.append('|------|------|--------|-----|-------|--------|')
+          lines.append(f'| vulnerable_bank.py | {vh} | {vm} | {vl} | {vh+vm+vl} | ❌ INSECURE |')
+          lines.append(f'| secure_bank.py     | {sh} | {sm} | {sl} | {sh+sm+sl} | {\"✅ SECURE\" if sh+sm == 0 else \"⚠️ NEEDS REVIEW\"} |')
+          lines.append(f'| main.py            | {mh} | {mm} | {ml} | {mh+mm+ml} | {\"✅ SECURE\" if mh+mm == 0 else \"⚠️ NEEDS REVIEW\"} |')
           lines.append('')
-          lines.append('### MEDIUM Severity Issues')
-          for i in medium:
-              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
-          lines.append('')
-          lines.append('### LOW Severity Issues')
-          for i in low:
-              lines.append(f\"- **{i['test_id']}** {i['issue_text']} in \`{i['filename']}\` line {i['line_number']}\")
+
+          vres = vuln.get('results', [])
+          high_issues   = [x for x in vres if x['issue_severity'] == 'HIGH']
+          medium_issues = [x for x in vres if x['issue_severity'] == 'MEDIUM']
+          low_issues    = [x for x in vres if x['issue_severity'] == 'LOW']
+
+          if high_issues:
+              lines.append('### 🔴 HIGH Severity Issues Found in vulnerable_bank.py')
+              for i in high_issues:
+                  lines.append(f\"- **{i['test_id']}** — {i['issue_text']} *(line {i['line_number']})*\")
+              lines.append('')
+
+          if medium_issues:
+              lines.append('### 🟡 MEDIUM Severity Issues Found in vulnerable_bank.py')
+              for i in medium_issues:
+                  lines.append(f\"- **{i['test_id']}** — {i['issue_text']} *(line {i['line_number']})*\")
+              lines.append('')
+
+          if low_issues:
+              lines.append('### 🟢 LOW Severity Issues Found in vulnerable_bank.py')
+              for i in low_issues:
+                  lines.append(f\"- **{i['test_id']}** — {i['issue_text']} *(line {i['line_number']})*\")
+              lines.append('')
+
+          sres = secure.get('results', [])
+          if sres:
+              lines.append('### ⚠️ Issues Found in secure_bank.py')
+              for i in sres:
+                  lines.append(f\"- **{i['test_id']}** [{i['issue_severity']}] — {i['issue_text']} *(line {i['line_number']})*\")
+              lines.append('')
+          else:
+              lines.append('### ✅ secure_bank.py — No Issues Found')
+              lines.append('')
+
+          lines.append('### 🎯 Pipeline Conclusion')
+          lines.append(f'- DevSecOps pipeline **detected {vh+vm+vl} vulnerabilities** in the vulnerable banking app.')
+          lines.append(f'- Secure implementation has **{sh+sm+sl} issue(s)** — safe to deploy to production.')
+          lines.append(f'- Production app (main.py) has **{mh+mm+ml} issue(s)** — clean and secure.')
+
           with open('summary.md', 'w') as f:
               f.write('\n'.join(lines))
           "
@@ -63,10 +118,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bandit-report
+          name: bandit-reports
           path: |
-            bandit-report.json
-            bandit-report.html
+            bandit-main.json
+            bandit-main.html
+            bandit-vuln.json
+            bandit-secure.json
 
 
   sca-snyk:
@@ -218,5 +275,4 @@ jobs:
         run: |
           curl -X POST -H 'Content-type: application/json' \
           --data "{\"text\": \"*DevSecOps Pipeline FAILED* :x:\", \"attachments\": [{\"color\": \"danger\", \"fields\": [{\"title\": \"Repository\", \"value\": \"${{ github.repository }}\", \"short\": true}, {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true}, {\"title\": \"Triggered by\", \"value\": \"${{ github.actor }}\", \"short\": true}, {\"title\": \"Action Required\", \"value\": \"Check GitHub Actions for details\", \"short\": false}]}]}" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}     
-        
+          ${{ secrets.SLACK_WEBHOOK_URL }}
